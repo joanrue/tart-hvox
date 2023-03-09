@@ -1,0 +1,180 @@
+#!/usr/bin/env python
+#
+# Copyright Tim Molteno 2023 tim@elec.ac.nz
+# License GPLv3
+#
+
+import matplotlib
+import os
+if os.name == 'posix' and "DISPLAY" not in os.environ:
+    matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+
+import argparse
+import json
+import logging
+import spotless
+import sys
+import setuptools
+import pkg_resources  # part of setuptools
+
+from copy import deepcopy
+from disko import DiSkO, sphere_from_args, sphere_args_parser
+
+import numpy as np
+
+from tart.operation import settings
+
+from tart_tools import api_handler
+from tart_tools import api_imaging
+from tart.imaging import elaz
+
+from tart_hvox import TartHVox
+
+from tart2ms import get_array_location
+
+logger = logging.getLogger()
+
+def handle_image(args, img, title, time_repr, src_list=None, sphere=None):
+    """ This function manages the output of an image, drawing sources e.t.c."""
+    image_title = f"{args.title}_{title}_{time_repr}"
+    plt.title(image_title)
+    if args.SVG:
+        fname = f"{image_title}.svg"
+        fpath = os.path.join(args.dir, fname)
+        sphere.to_svg(fname=fname, show_grid=True, src_list=src_list, title=image_title)
+        logger.info("Generating {}".format(fname))
+    if args.PDF:
+        fname = '{}.pdf'.format(image_title)
+        fpath = os.path.join(args.dir, fname)
+        plt.savefig(fpath, dpi=600)
+        logger.info("Generating {}".format(fname))
+    if args.display:
+        plt.show()
+
+
+if __name__ == '__main__':
+    
+    sphere_parsers = sphere_args_parser()
+
+    parser = argparse.ArgumentParser(description='Generate an HVOX image using the web api of a TART radio telescope.', 
+                                    formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+                                    parents=sphere_parsers)
+
+    data_group.add_argument('--ms', required=False, default=None, help="Measurement Set for radio telescope data")
+
+    parser.add_argument('--nvis', type=int, default=1000,
+                        help="Number of visibilities to use.")
+    parser.add_argument('--channel', type=int, default=0,
+                        help="Use this frequency channel.")
+    parser.add_argument('--field', type=int, default=0,
+                        help="Use this FIELD_ID from the measurement set.")
+    parser.add_argument('--ddid', type=int, default=0,
+                        help="Use this DDID from the measurement set.")
+    
+    parser.add_argument('--dir', required=False, default='.',
+                        help="Output directory.")
+
+    parser.add_argument('--multimodel', action="store_true",
+                        help="Use the SPOTLESS algorithm with multi-dimensional model.")
+
+    parser.add_argument('--beam', action="store_true",
+                        help="Generate a gridless beam.")
+
+    parser.add_argument('--display', action="store_true",
+                        help="Display Image to the user")
+    parser.add_argument('--fits', action="store_true",
+                        help="Generate a FITS format image")
+    parser.add_argument('--PNG', action="store_true",
+                        help="Generate a PNG format image")
+    parser.add_argument('--HDF', required=False, default=None,
+                        help="Generate an HDF format representation of the field of view")
+    parser.add_argument('--PDF', action="store_true",
+                        help="Generate a PDF format image")
+    parser.add_argument('--SVG', action="store_true",
+                        help="Generate a SVG format image")
+    parser.add_argument('--show-sources',
+                        action="store_true",
+                        help="Show known sources on images (only works on PNG).")
+    parser.add_argument('--elevation', type=float, 
+                        default=20.0, 
+                        help="Elevation limit for displaying sources (degrees)")
+    parser.add_argument('--title', required=False, 
+                        default="spotless", help="Prefix the output files.")
+
+    parser.add_argument('--version', action="store_true",
+                        help="Display the current version")
+    parser.add_argument('--show-model', action="store_true", help="Show the location of the model sources.")
+
+    source_json = None
+
+    ARGS = parser.parse_args()
+
+    logger.setLevel(logging.INFO)
+
+    # create console handler and set level to debug
+    ch = logging.StreamHandler()
+    ch.setLevel(logging.INFO)
+    
+    # create formatter
+    formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+    
+    # add formatter to ch
+    ch.setFormatter(formatter)
+    
+    # add ch to logger
+    logger.addHandler(ch)
+    
+    if ARGS.version:
+        version = pkg_resources.require("spotless")[0].version
+        print(f"tart_hvox: Version {version}")
+        print("          (c) 2023")
+        sys.exit(0)
+
+    ##  Here we have created a sphere object from the ARGS. This is described in the DisKo package. Contains a field of view (possibly a full sphere)
+    sphere = sphere_from_args(ARGS)
+    min_res = sphere.min_res()
+    logger.info(f"Min Res {min_res}")
+
+
+    logger.info(f"Getting Data from MS file: {ARGS.ms} to {sphere}")
+    if not os.path.exists(ARGS.ms):
+        raise RuntimeError(f"Measurement set {ARGS.ms} not found")
+
+    ## Now we get the measurement data which creates a DiSkO object (not too useful here, but holds the visibilities
+    
+    disko = DiSkO.from_ms(ARGS.ms, ARGS.nvis, res=min_res, channel=ARGS.channel, field_id=ARGS.field, ddid=ARGS.ddid)
+    # Convert from reduced Julian Date to timestamp.
+    timestamp = disko.timestamp
+    
+
+
+    # Set some sphere information
+    json_info = get_array_location(ARGS.ms)
+    lat = json_info['lat']
+    lon = json_info['lon']
+    height =json_info['height']
+    
+    sphere.set_info(timestamp=timestamp,
+                    lon=lon, lat=lat, height=height)
+
+    time_repr = "{:%Y_%m_%d_%H_%M_%S_%Z}".format(timestamp)
+
+    # Processing
+    should_make_images = ARGS.display or ARGS.PNG or ARGS.fits or ARGS.PDF or ARGS.SVG
+    
+    
+    
+    # Now USE HVOX 
+    if ARGS.multimodel:
+        spot = MultiSpotless(disko, sphere)
+    else:
+        spot = Spotless(disko, sphere)
+    
+    
+    reconstructed_sphere, src_power, residual_power = spot.reconstruct()
+
+        spot.plot(plt, reconstructed_sphere, 
+                  src_list, ARGS.show_model)
+        handle_image(ARGS, None, "spotless", time_repr,
+                     src_list, reconstructed_sphere)
